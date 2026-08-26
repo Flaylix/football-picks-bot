@@ -1,0 +1,31 @@
+name: Pronostics foot quotidiens
+
+on:
+  schedule:
+    # 06:00 UTC = 08:00 à Paris en heure d'été (UTC+2) / 07:00 en heure d'hiver (UTC+1).
+    # GitHub Actions ne gère pas les fuseaux horaires : ajuste cette valeur si besoin
+    # (ou laisse tel quel, le décalage d'1h deux fois par an est sans conséquence ici).
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}  # permet de lancer le workflow manuellement depuis l'onglet Actions
+
+jobs:
+  post-picks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installation des dépendances
+        run: pip install -r requirements.txt
+
+      - name: Génération et envoi des pronostics du jour
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python daily_picks.py
