@@ -19,7 +19,7 @@ Variables d'environnement requises :
 
 Variables optionnelles :
 - REGIONS         (def: "fr")   régions de bookmakers à interroger (fr, eu, uk...)
-- MIN_PROBABILITY (def: "0.80") seuil de confiance minimum (0 à 1) pour publier un pick
+- MIN_PROBABILITY (def: "0.65") seuil de confiance minimum (0 à 1) pour publier un pick
 - MIN_ODDS        (def: "1.20") cote minimum (meilleure cote dispo) pour publier un
                                  pick — évite les picks ultra-favoris mais sans
                                  intérêt (ex: cote à 1.03)
@@ -50,7 +50,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 REGIONS = os.environ.get("REGIONS", "fr")
-MIN_PROBABILITY = float(os.environ.get("MIN_PROBABILITY", "0.80"))
+MIN_PROBABILITY = float(os.environ.get("MIN_PROBABILITY", "0.65"))
 MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
 MAX_PICKS = int(os.environ.get("MAX_PICKS", "10"))
 PICKS_LOG_PATH = os.environ.get("PICKS_LOG_PATH", "data/picks_log.jsonl")
