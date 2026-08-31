@@ -55,24 +55,54 @@ MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
 MAX_PICKS = int(os.environ.get("MAX_PICKS", "10"))
 PICKS_LOG_PATH = os.environ.get("PICKS_LOG_PATH", "data/picks_log.jsonl")
 
-# Championnats/sports couverts par défaut. Liste des "sport keys" disponibles :
+# Sports/championnats couverts par défaut. Liste des "sport keys" disponibles :
 # https://the-odds-api.com/sports-odds-data/sports-apis.html
+# (à vérifier/mettre à jour via l'endpoint /v4/sports de l'API — les clés
+# peuvent changer ou ne pas être toutes actives selon ton abonnement).
 #
-# Foot : pas de nul possible dans notre modèle actuel (h2h à 2 issues) donc
-# on ne garde que les compétitions où la probabilité d'un des deux camps
-# peut vraiment dépasser le seuil. Tennis et NBA n'ont pas de match nul,
-# ce qui les rend structurellement plus fiables pour ce type de pronostic.
+# Stratégie : on élargit volontairement à un maximum de divisions et de
+# sports pour augmenter le nombre de matchs scannés chaque jour (plus de
+# volume = plus de chances de trouver au moins 3 matchs qui passent le
+# double filtre MIN_PROBABILITY / MIN_ODDS). Le filtre de sécurité reste
+# le même pour tout le monde : un match de National 2 ou de NBA n'est
+# retenu QUE s'il atteint le même niveau de confiance qu'un match de
+# Ligue 1. On ne baisse jamais le seuil pour "forcer" 3 picks — les jours
+# où le vivier ne suffit pas, on publie moins de 3 picks plutôt qu'un
+# pick moins fiable.
+# Sports/championnats couverts par défaut. Liste des "sport keys" disponibles :
+# https://the-odds-api.com/sports-odds-data/sports-apis.html
+# (à vérifier/mettre à jour via l'endpoint /v4/sports de l'API).
+#
+# Budget de quota : le workflow tourne 1 fois/jour, donc chaque entrée ici
+# = 1 requête API par jour = ~30 requêtes/mois. Avec 13 entrées :
+# 13 x 31 jours (mois le plus long) = 403 requêtes/mois, sous la limite de
+# 500 du plan gratuit, avec une marge pour des lancements manuels de test.
+# → Ne pas dépasser ~14-15 entrées sans passer à un plan payant.
+#
+# Sélection : on garde les compétitions les plus susceptibles de produire
+# de gros écarts de niveau (donc des probabilités très élevées) plutôt que
+# d'essayer d'être exhaustif — un championnat mineur homogène n'apporte pas
+# plus de picks sûrs qu'un grand championnat, autant garder le quota pour
+# les compétitions à fort potentiel d'écart, réparties sur les 4 sports.
 DEFAULT_SPORTS = [
-    "soccer_france_ligue_one",
+    # Foot — grands championnats + coupes européennes (où les gros clubs
+    # affrontent parfois des équipes largement plus faibles)
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_italy_serie_a",
     "soccer_germany_bundesliga",
+    "soccer_france_ligue_one",
     "soccer_uefa_champs_league",
     "soccer_uefa_europa_league",
+    # Tennis (pas de nul, écarts de classement parfois énormes)
     "tennis_atp",
     "tennis_wta",
+    # Basketball (pas de nul)
     "basketball_nba",
+    "basketball_euroleague",
+    # Hockey sur glace (pas de nul, vainqueur toujours désigné)
+    "icehockey_nhl",
+    "icehockey_khl",
 ]
 SPORTS = [s.strip() for s in os.environ.get("SPORTS", ",".join(DEFAULT_SPORTS)).split(",") if s.strip()]
 
@@ -185,6 +215,15 @@ def build_daily_picks():
         if m["probability"] >= MIN_PROBABILITY and m["odds"] >= MIN_ODDS
     ]
     confident_matches.sort(key=lambda m: m["probability"], reverse=True)
+
+    if len(confident_matches) < 3:
+        print(
+            f"[info] seulement {len(confident_matches)} pick(s) au-dessus du seuil "
+            f"aujourd'hui (objectif : au moins 3). On ne baisse pas le seuil pour "
+            f"combler — mieux vaut publier moins de picks que des picks moins sûrs.",
+            file=sys.stderr,
+        )
+
     return confident_matches[:MAX_PICKS]
 
 
