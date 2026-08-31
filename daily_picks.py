@@ -55,6 +55,14 @@ MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
 MAX_PICKS = int(os.environ.get("MAX_PICKS", "10"))
 PICKS_LOG_PATH = os.environ.get("PICKS_LOG_PATH", "data/picks_log.jsonl")
 
+# Combiné buteur (optionnel) : sur le match le plus sûr du jour (foot
+# uniquement), on tente de suggérer un buteur probable pour composer un
+# petit combiné. Coûte 1 requête API en plus par jour (endpoint dédié aux
+# cotes "joueur", séparé du marché résultat du match), pas disponible sur
+# tous les matchs (dépend de la couverture des bookmakers).
+ENABLE_SCORER_COMBO = os.environ.get("ENABLE_SCORER_COMBO", "true").lower() == "true"
+SCORER_MARKET = "player_goal_scorer_anytime"
+
 # Sports/championnats couverts par défaut. Liste des "sport keys" disponibles :
 # https://the-odds-api.com/sports-odds-data/sports-apis.html
 # (à vérifier/mettre à jour via l'endpoint /v4/sports de l'API — les clés
@@ -182,6 +190,7 @@ def analyze_event(event: dict, sport_key: str):
     pick_odds, pick_bookmaker = outcome_best_odds[pick_name]
 
     return {
+        "event_id": event["id"],
         "sport": sport_key,
         "home": event["home_team"],
         "away": event["away_team"],
@@ -194,7 +203,74 @@ def analyze_event(event: dict, sport_key: str):
     }
 
 
-def build_daily_picks():
+def fetch_top_scorer(sport_key: str, event_id: str):
+    """Tente de récupérer un buteur probable pour un match donné (foot
+    uniquement), via le marché "anytime goalscorer".
+
+    ⚠️ Contrairement à analyze_event(), on ne retire PAS la marge ici :
+    plusieurs joueurs peuvent marquer sur le même match (ce ne sont pas des
+    issues mutuellement exclusives), donc la normalisation "de-vig" utilisée
+    pour le résultat du match (1N2) ne s'applique pas de la même façon. La
+    probabilité retournée est une estimation brute (1 / cote), à prendre
+    avec plus de précaution que le pronostic principal.
+
+    Retourne None si le marché n'est pas disponible pour ce match (fréquent
+    sur les divisions moins couvertes) — ce n'est pas une erreur, juste une
+    absence de données à cet endpoint pour ce match précis.
+    """
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/events/{event_id}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": REGIONS,
+        "markets": SCORER_MARKET,
+        "oddsFormat": "decimal",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=20)
+    except requests.RequestException as exc:
+        print(f"[warn] buteur {event_id}: erreur réseau ({exc})", file=sys.stderr)
+        return None
+
+    if resp.status_code != 200:
+        # Très fréquent : ce marché n'existe simplement pas pour ce match.
+        print(f"[info] buteur {event_id}: pas de cotes buteur disponibles (HTTP {resp.status_code})", file=sys.stderr)
+        return None
+
+    data = resp.json()
+    best_by_player: dict[str, tuple[float, str]] = {}
+
+    for bookmaker in data.get("bookmakers", []):
+        for market in bookmaker.get("markets", []):
+            if market.get("key") != SCORER_MARKET:
+                continue
+            for outcome in market.get("outcomes", []):
+                # Format standard The Odds API pour les marchés joueur :
+                # outcome["name"] = "Yes"/"Over" etc., outcome["description"] = nom du joueur.
+                if outcome.get("name") not in ("Yes", "Over"):
+                    continue
+                player = outcome.get("description")
+                price = outcome.get("price")
+                if not player or not price:
+                    continue
+                current = best_by_player.get(player)
+                if current is None or price > current[0]:
+                    best_by_player[player] = (price, bookmaker.get("title", "?"))
+
+    if not best_by_player:
+        return None
+
+    # Le "meilleur" buteur probable = celui dont la cote (la plus haute
+    # dispo) implique la plus forte probabilité brute (1/cote la plus basse).
+    player, (odds, bookmaker) = min(best_by_player.items(), key=lambda kv: kv[1][0])
+    return {
+        "player": player,
+        "probability": 1 / odds,
+        "odds": odds,
+        "bookmaker": bookmaker,
+    }
+
+
+
     all_matches = []
     for sport in SPORTS:
         for event in fetch_odds_for_sport(sport):
@@ -227,7 +303,28 @@ def build_daily_picks():
     return confident_matches[:MAX_PICKS]
 
 
-def format_message(matches):
+def get_scorer_combo(matches):
+    """Cherche, parmi les picks retenus, le match de foot le plus sûr
+    (probabilité la plus haute) et tente d'y associer un buteur probable.
+    Retourne None si aucun match de foot n'est dans les picks, ou si le
+    marché buteur n'est pas disponible pour ce match.
+    """
+    if not ENABLE_SCORER_COMBO:
+        return None
+
+    soccer_matches = [m for m in matches if m["sport"].startswith("soccer_")]
+    if not soccer_matches:
+        return None
+
+    top_match = soccer_matches[0]  # déjà trié par probabilité décroissante
+    scorer = fetch_top_scorer(top_match["sport"], top_match["event_id"])
+    if not scorer:
+        return None
+
+    return {"match": top_match, "scorer": scorer}
+
+
+def format_message(matches, scorer_combo=None):
     today = datetime.now(PARIS_TZ).strftime("%d/%m/%Y")
 
     if not matches:
@@ -253,11 +350,24 @@ def format_message(matches):
             f"   💰 Meilleure cote : {m['odds']:.2f} ({m['bookmaker']})\n"
         )
 
+    if scorer_combo:
+        m = scorer_combo["match"]
+        s = scorer_combo["scorer"]
+        pct = round(s["probability"] * 100)
+        lines.append(
+            f"\n⚡ *Combiné du jour* — {m['home']} vs {m['away']}\n"
+            f"   🎯 Vainqueur : *{m['pick']}*\n"
+            f"   ⚽ Buteur suggéré : *{s['player']}* (~{pct}%, cote {s['odds']:.2f} — {s['bookmaker']})\n"
+            f"   _Estimation brute, pas de retrait de marge sur ce marché — "
+            f"à prendre avec plus de prudence que le pronostic principal._"
+        )
+
     lines.append(
         "\n_Probabilités calculées à partir des cotes des bookmakers "
-        "(marge retirée), ce n'est pas une garantie de résultat. Le pari "
-        "sportif comporte des risques financiers — jouez avec modération, "
-        "18+, interdit aux mineurs. joueurs-info-service.fr_"
+        "(marge retirée pour le résultat du match), ce n'est pas une "
+        "garantie de résultat. Le pari sportif comporte des risques "
+        "financiers — jouez avec modération, 18+, interdit aux mineurs. "
+        "joueurs-info-service.fr_"
     )
     return "\n".join(lines)
 
@@ -314,7 +424,8 @@ def main():
         sys.exit(1)
 
     picks = build_daily_picks()
-    message = format_message(picks)
+    scorer_combo = get_scorer_combo(picks)
+    message = format_message(picks, scorer_combo)
     print(message)
     send_telegram_message(message)
     log_picks(picks)
