@@ -269,8 +269,7 @@ def fetch_top_scorer(sport_key: str, event_id: str):
         "bookmaker": bookmaker,
     }
 
-
-
+def build_daily_picks():
     all_matches = []
     for sport in SPORTS:
         for event in fetch_odds_for_sport(sport):
