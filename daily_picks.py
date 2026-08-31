@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Bot de pronostics football quotidien.
+Bot de pronostics multi-sport quotidien.
 
 Récupère les cotes du jour (Winamax, Betclic, etc. via The Odds API),
 calcule une probabilité de marché pour chaque issue (marge bookmaker
-retirée, moyennée sur les bookmakers disponibles), sélectionne les
-matchs les plus "sûrs" du jour et poste le résumé sur un channel ou
-groupe Telegram.
+retirée, moyennée sur les bookmakers disponibles), ne garde que les
+matchs jugés suffisamment sûrs (seuil de confiance) et poste le résumé
+sur un channel ou groupe Telegram.
 
 ⚠️ Ces probabilités sont dérivées des cotes du marché : elles reflètent
 ce que les bookmakers pensent, pas une prédiction garantie. Ce script
@@ -18,15 +18,23 @@ Variables d'environnement requises :
 - TELEGRAM_CHAT_ID   id du channel/groupe Telegram cible (ex: -1001234567890)
 
 Variables optionnelles :
-- REGIONS  (def: "fr")  régions de bookmakers à interroger (fr, eu, uk...)
-- TOP_N    (def: "10")  nombre de matchs à publier
-- SPORTS   (def: grands championnats européens, voir DEFAULT_SPORTS)
-           liste séparée par des virgules de "sport keys" The Odds API
+- REGIONS         (def: "fr")   régions de bookmakers à interroger (fr, eu, uk...)
+- MIN_PROBABILITY (def: "0.80") seuil de confiance minimum (0 à 1) pour publier un pick
+- MAX_PICKS       (def: "10")   nombre maximum de picks publiés, même s'il y en a
+                                 plus au-dessus du seuil (garde-fou contre un jour
+                                 avec beaucoup de très gros favoris)
+- SPORTS          (def: grands championnats + tennis + NBA, voir DEFAULT_SPORTS)
+                   liste séparée par des virgules de "sport keys" The Odds API
+- PICKS_LOG_PATH  (def: "data/picks_log.jsonl") fichier où chaque pick envoyé
+                   est enregistré (un JSON par ligne), pour calculer le taux
+                   de réussite réel a posteriori.
 """
 
+import json
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -39,10 +47,17 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 REGIONS = os.environ.get("REGIONS", "fr")
-TOP_N = int(os.environ.get("TOP_N", "10"))
+MIN_PROBABILITY = float(os.environ.get("MIN_PROBABILITY", "0.80"))
+MAX_PICKS = int(os.environ.get("MAX_PICKS", "10"))
+PICKS_LOG_PATH = os.environ.get("PICKS_LOG_PATH", "data/picks_log.jsonl")
 
-# Championnats couverts par défaut. Liste des "sport keys" disponibles :
+# Championnats/sports couverts par défaut. Liste des "sport keys" disponibles :
 # https://the-odds-api.com/sports-odds-data/sports-apis.html
+#
+# Foot : pas de nul possible dans notre modèle actuel (h2h à 2 issues) donc
+# on ne garde que les compétitions où la probabilité d'un des deux camps
+# peut vraiment dépasser le seuil. Tennis et NBA n'ont pas de match nul,
+# ce qui les rend structurellement plus fiables pour ce type de pronostic.
 DEFAULT_SPORTS = [
     "soccer_france_ligue_one",
     "soccer_epl",
@@ -51,6 +66,9 @@ DEFAULT_SPORTS = [
     "soccer_germany_bundesliga",
     "soccer_uefa_champs_league",
     "soccer_uefa_europa_league",
+    "tennis_atp",
+    "tennis_wta",
+    "basketball_nba",
 ]
 SPORTS = [s.strip() for s in os.environ.get("SPORTS", ",".join(DEFAULT_SPORTS)).split(",") if s.strip()]
 
@@ -59,7 +77,7 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 
 def fetch_odds_for_sport(sport_key: str):
-    """Récupère les cotes 1N2 (h2h) du jour pour un championnat donné."""
+    """Récupère les cotes h2h du jour pour un sport/championnat donné."""
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -91,7 +109,7 @@ def is_today_paris(iso_ts: str) -> bool:
     return dt.date() == now.date()
 
 
-def analyze_event(event: dict):
+def analyze_event(event: dict, sport_key: str):
     """Calcule, pour un match, l'issue la plus probable selon le marché.
 
     Pour chaque bookmaker on retire la marge (overround) en normalisant
@@ -130,6 +148,7 @@ def analyze_event(event: dict):
     pick_odds, pick_bookmaker = outcome_best_odds[pick_name]
 
     return {
+        "sport": sport_key,
         "home": event["home_team"],
         "away": event["away_team"],
         "commence_time": event["commence_time"],
@@ -147,12 +166,17 @@ def build_daily_picks():
         for event in fetch_odds_for_sport(sport):
             if not is_today_paris(event["commence_time"]):
                 continue
-            analysis = analyze_event(event)
+            analysis = analyze_event(event, sport)
             if analysis:
                 all_matches.append(analysis)
 
-    all_matches.sort(key=lambda m: m["probability"], reverse=True)
-    return all_matches[:TOP_N]
+    # On ne garde que les picks au-dessus du seuil de confiance, et on
+    # trie les meilleurs en premier. Un jour sans favori assez net peut
+    # tout à fait donner une liste vide, et 'est voulu : mieux vaut
+    # publier zéro pick fiable qu'un pick incertain.
+    confident_matches = [m for m in all_matches if m["probability"] >= MIN_PROBABILITY]
+    confident_matches.sort(key=lambda m: m["probability"], reverse=True)
+    return confident_matches[:MAX_PICKS]
 
 
 def format_message(matches):
@@ -160,12 +184,13 @@ def format_message(matches):
 
     if not matches:
         return (
-            f"⚽ *Pronostics du {today}*\n\n"
-            "Aucun match avec des cotes disponibles aujourd'hui sur les "
-            "championnats suivis."
+            f"🎯 *Pronostics du {today}*\n\n"
+            f"Aucun match n'atteint aujourd'hui le seuil de confiance "
+            f"({round(MIN_PROBABILITY * 100)}%) sur les sports suivis. "
+            f"On ne publie que les picks les plus fiables."
         )
 
-    lines = [f"⚽ *Pronostics du jour — {today}*\n"]
+    lines = [f"🎯 *Pronostics du jour — {today}*\n"]
     for i, m in enumerate(matches, 1):
         kickoff = (
             datetime.fromisoformat(m["commence_time"].replace("Z", "+00:00"))
@@ -187,6 +212,27 @@ def format_message(matches):
         "18+, interdit aux mineurs. joueurs-info-service.fr_"
     )
     return "\n".join(lines)
+
+
+def log_picks(matches):
+    """Enregistre chaque pick envoyé pour pouvoir calculer le taux de
+    réussite réel plus tard (comparaison avec le résultat final).
+
+    ⚠️ Sur GitHub Actions, le système de fichiers est éphémère : ce fichier
+    doit être commité/poussé dans le repo à la fin du workflow pour être
+    conservé d'une exécution à l'autre (voir le .yml du workflow).
+    """
+    if not matches:
+        return
+
+    path = Path(PICKS_LOG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    now_iso = datetime.now(PARIS_TZ).isoformat()
+    with path.open("a", encoding="utf-8") as f:
+        for m in matches:
+            entry = {**m, "sent_at": now_iso, "result": None}  # 'result' à remplir plus tard
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def send_telegram_message(text: str):
@@ -223,6 +269,7 @@ def main():
     message = format_message(picks)
     print(message)
     send_telegram_message(message)
+    log_picks(picks)
 
 
 if __name__ == "__main__":
