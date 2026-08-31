@@ -20,6 +20,9 @@ Variables d'environnement requises :
 Variables optionnelles :
 - REGIONS         (def: "fr")   régions de bookmakers à interroger (fr, eu, uk...)
 - MIN_PROBABILITY (def: "0.80") seuil de confiance minimum (0 à 1) pour publier un pick
+- MIN_ODDS        (def: "1.20") cote minimum (meilleure cote dispo) pour publier un
+                                 pick — évite les picks ultra-favoris mais sans
+                                 intérêt (ex: cote à 1.03)
 - MAX_PICKS       (def: "10")   nombre maximum de picks publiés, même s'il y en a
                                  plus au-dessus du seuil (garde-fou contre un jour
                                  avec beaucoup de très gros favoris)
@@ -48,6 +51,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 REGIONS = os.environ.get("REGIONS", "fr")
 MIN_PROBABILITY = float(os.environ.get("MIN_PROBABILITY", "0.80"))
+MIN_ODDS = float(os.environ.get("MIN_ODDS", "1.20"))
 MAX_PICKS = int(os.environ.get("MAX_PICKS", "10"))
 PICKS_LOG_PATH = os.environ.get("PICKS_LOG_PATH", "data/picks_log.jsonl")
 
@@ -170,11 +174,16 @@ def build_daily_picks():
             if analysis:
                 all_matches.append(analysis)
 
-    # On ne garde que les picks au-dessus du seuil de confiance, et on
-    # trie les meilleurs en premier. Un jour sans favori assez net peut
-    # tout à fait donner une liste vide, et 'est voulu : mieux vaut
-    # publier zéro pick fiable qu'un pick incertain.
-    confident_matches = [m for m in all_matches if m["probability"] >= MIN_PROBABILITY]
+    # On ne garde que les picks au-dessus du seuil de confiance ET dont la
+    # cote reste au moins à MIN_ODDS (sinon le pick est "sûr" mais sans
+    # intérêt : une cote à 1.03 ne rapporte quasi rien). Les meilleurs
+    # picks (probabilité la plus haute) sont affichés en premier. Un jour
+    # sans favori assez net peut tout à fait donner une liste vide, et
+    # c'est voulu : mieux vaut publier zéro pick fiable qu'un pick incertain.
+    confident_matches = [
+        m for m in all_matches
+        if m["probability"] >= MIN_PROBABILITY and m["odds"] >= MIN_ODDS
+    ]
     confident_matches.sort(key=lambda m: m["probability"], reverse=True)
     return confident_matches[:MAX_PICKS]
 
