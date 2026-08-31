@@ -5,8 +5,14 @@ on:
     # 06:00 UTC = 08:00 à Paris en heure d'été (UTC+2) / 07:00 en heure d'hiver (UTC+1).
     # GitHub Actions ne gère pas les fuseaux horaires : ajuste cette valeur si besoin
     # (ou laisse tel quel, le décalage d'1h deux fois par an est sans conséquence ici).
+    # Note : GitHub Actions ne garantit pas l'heure exacte d'un cron planifié — un
+    # retard de quelques dizaines de minutes (voire plus en cas de forte charge sur
+    # leurs serveurs) est possible et normal.
     - cron: "0 6 * * *"
   workflow_dispatch: {}  # permet de lancer le workflow manuellement depuis l'onglet Actions
+
+permissions:
+  contents: write  # nécessaire pour que le job puisse commit/push le fichier de log
 
 jobs:
   post-picks:
@@ -29,3 +35,15 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python daily_picks.py
+
+      - name: Sauvegarde du log des pronostics
+        run: |
+          if [ -n "$(git status --porcelain data/picks_log.jsonl 2>/dev/null)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add data/picks_log.jsonl
+            git commit -m "Log des pronostics du $(date -u +%Y-%m-%d)"
+            git push
+          else
+            echo "Rien à committer (pas de nouveau pick aujourd'hui, ou fichier inchangé)."
+          fi
